@@ -1,0 +1,35 @@
+# ======================================
+# InteriorInpaint - Core Requirements
+# ======================================
+
+# Core ML Libraries
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Diffusion Models
+diffusers>=0.27.0
+transformers>=4.35.0
+accelerate>=0.25.0
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# Model Optimization (Optional but recommended)
+# xformers>=0.0.22  # Uncomment if you have compatible GPU
+# bitsandbytes>=0.41.0  # Uncomment for 8-bit optimizers
+
+# Training Utilities
+tqdm>=4.65.0
+tensorboard>=2.14.0
+omegaconf>=2.3.0
+
+# HuggingFace Hub
+huggingface-hub>=0.19.0
+safetensors>=0.4.0
+
+# Misc
+peft>=0.7.0  # For LoRA training
+datasets>=2.14.0  # For dataset loading (optional)

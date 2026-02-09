@@ -1,0 +1,1 @@
+from .pipeline_hybrid_sd_xl import StableDiffusionXLHybridPipeline

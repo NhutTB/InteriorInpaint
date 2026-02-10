@@ -271,6 +271,9 @@ class SequentialEditingDataset(Dataset):
         Create masked input by blacking out the region defined by mask.
         This simulates the conditioning image for BrushNet.
         """
+        if mask.size != input_img.size:
+            mask = mask.resize(input_img.size, resample=Image.NEAREST)
+
         input_np = np.array(input_img)
         mask_np = np.array(mask)
 
@@ -431,9 +434,11 @@ def log_validation(vae, unet, brushnet, text_encoders, tokenizers,
                 list(original_size) + [0, 0] + [args.resolution, args.resolution]
             ], device=accelerator.device, dtype=weight_dtype)
 
+            # Explicitly cast to weight_dtype to avoid "Float vs Half" errors
+            prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
             added_cond_kwargs = {
-                "text_embeds": pooled_prompt_embeds,
-                "time_ids": add_time_ids,
+                "text_embeds": pooled_prompt_embeds.to(dtype=weight_dtype),
+                "time_ids": add_time_ids.to(dtype=weight_dtype),
             }
 
             # BrushNet conditioning
@@ -739,6 +744,12 @@ def train_sequential_editing(args):
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
+    params_to_optimize = []
+    if args.train_unet:
+        params_to_optimize.extend(list(unet.parameters()))
+    if args.train_brushnet:
+        params_to_optimize.extend(list(brushnet.parameters()))
+
     print(f"✓ Training for {max_train_steps} steps ({args.num_train_epochs} epochs)")
 
     # Log dataset info to wandb
@@ -850,36 +861,48 @@ def train_sequential_editing(args):
                     add_time_ids_list, device=target_latents.device, dtype=weight_dtype
                 )
 
+                # Prepare conditioning
+                prompt_embeds = prompt_embeds.to(dtype=weight_dtype)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=weight_dtype)
+                add_time_ids = add_time_ids.to(dtype=weight_dtype)
+                
                 added_cond_kwargs = {
                     "text_embeds": pooled_prompt_embeds,
                     "time_ids": add_time_ids,
                 }
 
-                # BrushNet forward
-                brushnet_cond = torch.cat([masked_latents, mask.to(masked_latents.dtype)], dim=1)
+                # BrushNet conditioning
+                brushnet_cond = torch.cat([masked_latents, mask.to(masked_latents.dtype)], dim=1).to(dtype=weight_dtype)
+                
+                # Ensure main inputs are correct dtype
+                noisy_latents = noisy_latents.to(dtype=weight_dtype)
 
+                # BrushNet forward
                 brushnet_output = brushnet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=prompt_embeds,
-                    brushnet_cond=brushnet_cond,
                     added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
+                    brushnet_cond=brushnet_cond,
+                    return_dict=False, 
                 )
 
-                down_block_res_samples, mid_block_res_sample, up_block_res_samples = brushnet_output
+                raw_down_samples = brushnet_output[0]
+                raw_mid_sample = brushnet_output[1]
+                
+                # Ensure residuals are correct dtype
+                down_block_res_samples = [res.to(dtype=weight_dtype) for res in raw_down_samples]
+                mid_block_res_sample = raw_mid_sample.to(dtype=weight_dtype)
 
-                # UNet forward
+                # Predict the noise residual
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
-                    prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
                     added_cond_kwargs=added_cond_kwargs,
                     down_block_add_samples=down_block_res_samples,
                     mid_block_add_sample=mid_block_res_sample,
-                    up_block_add_samples=up_block_res_samples,
-                    return_dict=False,
-                )[0]
+                ).sample
 
                 # Loss
                 if noise_scheduler.config.prediction_type == "epsilon":

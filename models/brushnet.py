@@ -16,7 +16,7 @@ from diffusers.models.attention_processor import (
 )
 from diffusers.models.embeddings import TextImageProjection, TextImageTimeEmbedding, TextTimeEmbedding, TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unets.unet_2d_blocks import (
+from .unets.unet_2d_blocks import (
     CrossAttnDownBlock2D,
     DownBlock2D,
     UNetMidBlock2D,
@@ -24,18 +24,13 @@ from diffusers.models.unets.unet_2d_blocks import (
     get_down_block,
     get_mid_block,
     get_up_block,
+    MidBlock2D
 )
 
 from .unets.unet_2d_condition import UNet2DConditionModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-def zero_module(module):
-    for p in module.parameters():
-        nn.init.zeros_(p)
-    return module
 
 
 @dataclass
@@ -66,6 +61,75 @@ class BrushNetOutput(BaseOutput):
 class BrushNetModel(ModelMixin, ConfigMixin):
     """
     A BrushNet model.
+
+    Args:
+        in_channels (`int`, defaults to 4):
+            The number of channels in the input sample.
+        flip_sin_to_cos (`bool`, defaults to `True`):
+            Whether to flip the sin to cos in the time embedding.
+        freq_shift (`int`, defaults to 0):
+            The frequency shift to apply to the time embedding.
+        down_block_types (`tuple[str]`, defaults to `("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")`):
+            The tuple of downsample blocks to use.
+        mid_block_type (`str`, *optional*, defaults to `"UNetMidBlock2DCrossAttn"`):
+            Block type for middle of UNet, it can be one of `UNetMidBlock2DCrossAttn`, `UNetMidBlock2D`, or
+            `UNetMidBlock2DSimpleCrossAttn`. If `None`, the mid block layer is skipped.
+        up_block_types (`Tuple[str]`, *optional*, defaults to `("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")`):
+            The tuple of upsample blocks to use.
+        only_cross_attention (`Union[bool, Tuple[bool]]`, defaults to `False`):
+        block_out_channels (`tuple[int]`, defaults to `(320, 640, 1280, 1280)`):
+            The tuple of output channels for each block.
+        layers_per_block (`int`, defaults to 2):
+            The number of layers per block.
+        downsample_padding (`int`, defaults to 1):
+            The padding to use for the downsampling convolution.
+        mid_block_scale_factor (`float`, defaults to 1):
+            The scale factor to use for the mid block.
+        act_fn (`str`, defaults to "silu"):
+            The activation function to use.
+        norm_num_groups (`int`, *optional*, defaults to 32):
+            The number of groups to use for the normalization. If None, normalization and activation layers is skipped
+            in post-processing.
+        norm_eps (`float`, defaults to 1e-5):
+            The epsilon to use for the normalization.
+        cross_attention_dim (`int`, defaults to 1280):
+            The dimension of the cross attention features.
+        transformer_layers_per_block (`int` or `Tuple[int]`, *optional*, defaults to 1):
+            The number of transformer blocks of type [`~models.attention.BasicTransformerBlock`]. Only relevant for
+            [`~models.unet_2d_blocks.CrossAttnDownBlock2D`], [`~models.unet_2d_blocks.CrossAttnUpBlock2D`],
+            [`~models.unet_2d_blocks.UNetMidBlock2DCrossAttn`].
+        encoder_hid_dim (`int`, *optional*, defaults to None):
+            If `encoder_hid_dim_type` is defined, `encoder_hidden_states` will be projected from `encoder_hid_dim`
+            dimension to `cross_attention_dim`.
+        encoder_hid_dim_type (`str`, *optional*, defaults to `None`):
+            If given, the `encoder_hidden_states` and potentially other embeddings are down-projected to text
+            embeddings of dimension `cross_attention` according to `encoder_hid_dim_type`.
+        attention_head_dim (`Union[int, Tuple[int]]`, defaults to 8):
+            The dimension of the attention heads.
+        use_linear_projection (`bool`, defaults to `False`):
+        class_embed_type (`str`, *optional*, defaults to `None`):
+            The type of class embedding to use which is ultimately summed with the time embeddings. Choose from None,
+            `"timestep"`, `"identity"`, `"projection"`, or `"simple_projection"`.
+        addition_embed_type (`str`, *optional*, defaults to `None`):
+            Configures an optional embedding which will be summed with the time embeddings. Choose from `None` or
+            "text". "text" will use the `TextTimeEmbedding` layer.
+        num_class_embeds (`int`, *optional*, defaults to 0):
+            Input dimension of the learnable embedding matrix to be projected to `time_embed_dim`, when performing
+            class conditioning with `class_embed_type` equal to `None`.
+        upcast_attention (`bool`, defaults to `False`):
+        resnet_time_scale_shift (`str`, defaults to `"default"`):
+            Time scale shift config for ResNet blocks (see `ResnetBlock2D`). Choose from `default` or `scale_shift`.
+        projection_class_embeddings_input_dim (`int`, *optional*, defaults to `None`):
+            The dimension of the `class_labels` input when `class_embed_type="projection"`. Required when
+            `class_embed_type="projection"`.
+        brushnet_conditioning_channel_order (`str`, defaults to `"rgb"`):
+            The channel order of conditional image. Will convert to `rgb` if it's `bgr`.
+        conditioning_embedding_out_channels (`tuple[int]`, *optional*, defaults to `(16, 32, 96, 256)`):
+            The tuple of output channel for each block in the `conditioning_embedding` layer.
+        global_pool_conditions (`bool`, defaults to `False`):
+            TODO(Patrick) - unused parameter.
+        addition_embed_type_num_heads (`int`, defaults to 64):
+            The number of heads to use for the `TextTimeEmbedding` layer.
     """
 
     _supports_gradient_checkpointing = True
@@ -607,7 +671,23 @@ class BrushNetModel(ModelMixin, ConfigMixin):
         for module in self.children():
             fn_recursive_set_attention_slice(module, reversed_slice_size)
 
-    def _set_gradient_checkpointing(self, module, value: bool = False) -> None:
+    def _set_gradient_checkpointing(
+        self,
+        module=None,
+        value: bool = False,
+        enable: Optional[bool] = None,
+        gradient_checkpointing_func: Optional[Any] = None,
+    ) -> None:
+        # Support older and newer diffusers signatures.
+        if enable is not None:
+            value = enable
+
+        if module is None:
+            for child in self.modules():
+                if isinstance(child, (CrossAttnDownBlock2D, DownBlock2D)):
+                    child.gradient_checkpointing = value
+            return
+
         if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D)):
             module.gradient_checkpointing = value
 
@@ -670,7 +750,7 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
         if channel_order == "rgb":
             # in rgb order by default
-            pass
+            ...
         elif channel_order == "bgr":
             brushnet_cond = torch.flip(brushnet_cond, dims=[1])
         else:
@@ -736,18 +816,19 @@ class BrushNetModel(ModelMixin, ConfigMixin):
                 time_embeds = self.add_time_proj(time_ids.flatten())
                 time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
 
-                aug_emb = self.add_embedding(text_embeds, time_embeds)
-            
-            emb = emb + aug_emb
+                add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+                add_embeds = add_embeds.to(emb.dtype)
+                aug_emb = self.add_embedding(add_embeds)
+
+        emb = emb + aug_emb if aug_emb is not None else emb
 
         # 2. pre-process
-        # sample = self.conv_in(sample)
-        sample = self.conv_in_condition(torch.cat([sample, brushnet_cond], dim=1))
+        brushnet_cond=torch.concat([sample,brushnet_cond],1)
+        sample = self.conv_in_condition(brushnet_cond)
 
 
         # 3. down
-        down_block_res_samples = ()
-
+        down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
             if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
                 sample, res_samples = downsample_block(
@@ -762,7 +843,14 @@ class BrushNetModel(ModelMixin, ConfigMixin):
 
             down_block_res_samples += res_samples
 
-        # 4. mid
+        # 4. PaintingNet down blocks
+        brushnet_down_block_res_samples = ()
+        for down_block_res_sample, brushnet_down_block in zip(down_block_res_samples, self.brushnet_down_blocks):
+            down_block_res_sample = brushnet_down_block(down_block_res_sample)
+            brushnet_down_block_res_samples = brushnet_down_block_res_samples + (down_block_res_sample,)
+
+
+        # 5. mid
         if self.mid_block is not None:
             if hasattr(self.mid_block, "has_cross_attention") and self.mid_block.has_cross_attention:
                 sample = self.mid_block(
@@ -775,9 +863,11 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             else:
                 sample = self.mid_block(sample, emb)
 
-        mid_block_res_sample = sample
-        
-        # 5. up
+        # 6. BrushNet mid blocks
+        brushnet_mid_block_res_sample = self.brushnet_mid_block(sample)
+
+
+        # 7. up
         up_block_res_samples = ()
         for i, upsample_block in enumerate(self.up_blocks):
             is_final_block = i == len(self.up_blocks) - 1
@@ -785,51 +875,73 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
 
+            # if we have not reached the final block and need to forward the
+            # upsample size, we do it here
+            if not is_final_block:
+                upsample_size = down_block_res_samples[-1].shape[2:]
+
             if hasattr(upsample_block, "has_cross_attention") and upsample_block.has_cross_attention:
-                sample = upsample_block(
+                sample, up_res_samples = upsample_block(
                     hidden_states=sample,
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
                     encoder_hidden_states=encoder_hidden_states,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    upsample_size=upsample_size,
                     attention_mask=attention_mask,
+                    return_res_samples=True
                 )
             else:
-                sample = upsample_block(
+                sample, up_res_samples = upsample_block(
                     hidden_states=sample,
                     temb=emb,
                     res_hidden_states_tuple=res_samples,
+                    upsample_size=upsample_size,
+                    return_res_samples=True
                 )
-            
-            up_block_res_samples += (sample,)
 
-        # 6. processing brushnet output
-        
-        # 6.1 down
-        down_block_res_samples = ()
-        for i, down_block_res_sample in enumerate(down_block_res_samples):
-            down_block_res_sample = self.brushnet_down_blocks[i](down_block_res_sample)
-            down_block_res_samples += (down_block_res_sample,)
+            up_block_res_samples += up_res_samples
 
-        # 6.2 mid
-        mid_block_res_sample = self.brushnet_mid_block(mid_block_res_sample)
+        # 8. BrushNet up blocks
+        brushnet_up_block_res_samples = ()
+        for up_block_res_sample, brushnet_up_block in zip(up_block_res_samples, self.brushnet_up_blocks):
+            up_block_res_sample = brushnet_up_block(up_block_res_sample)
+            brushnet_up_block_res_samples = brushnet_up_block_res_samples + (up_block_res_sample,)
 
-        # 6.3 up
-        up_block_res_samples_new = ()
-        for i, up_block_res_sample in enumerate(up_block_res_samples):
-            up_block_res_sample = self.brushnet_up_blocks[i](up_block_res_sample)
-            up_block_res_samples_new += (up_block_res_sample,)
+        # 6. scaling
+        if guess_mode and not self.config.global_pool_conditions:
+            scales = torch.logspace(-1, 0, len(brushnet_down_block_res_samples) + 1 + len(brushnet_up_block_res_samples), device=sample.device)  # 0.1 to 1.0
+            scales = scales * conditioning_scale
 
-        # 6.4 scaling
-        down_block_res_samples = [sample * conditioning_scale for sample in down_block_res_samples]
-        mid_block_res_sample = mid_block_res_sample * conditioning_scale
-        up_block_res_samples_new = [sample * conditioning_scale for sample in up_block_res_samples_new]
+            brushnet_down_block_res_samples = [sample * scale for sample, scale in zip(brushnet_down_block_res_samples, scales[:len(brushnet_down_block_res_samples)])]
+            brushnet_mid_block_res_sample = brushnet_mid_block_res_sample * scales[len(brushnet_down_block_res_samples)]
+            brushnet_up_block_res_samples = [sample * scale for sample, scale in zip(brushnet_up_block_res_samples, scales[len(brushnet_down_block_res_samples)+1:])]
+        else:
+            brushnet_down_block_res_samples = [sample * conditioning_scale for sample in brushnet_down_block_res_samples]
+            brushnet_mid_block_res_sample = brushnet_mid_block_res_sample * conditioning_scale
+            brushnet_up_block_res_samples = [sample * conditioning_scale for sample in brushnet_up_block_res_samples]
+
+
+        if self.config.global_pool_conditions:
+            brushnet_down_block_res_samples = [
+                torch.mean(sample, dim=(2, 3), keepdim=True) for sample in brushnet_down_block_res_samples
+            ]
+            brushnet_mid_block_res_sample = torch.mean(brushnet_mid_block_res_sample, dim=(2, 3), keepdim=True)
+            brushnet_up_block_res_samples = [
+                torch.mean(sample, dim=(2, 3), keepdim=True) for sample in brushnet_up_block_res_samples
+            ]
 
         if not return_dict:
-            return (down_block_res_samples, mid_block_res_sample, up_block_res_samples_new)
+            return (brushnet_down_block_res_samples, brushnet_mid_block_res_sample, brushnet_up_block_res_samples)
 
         return BrushNetOutput(
-            down_block_res_samples=down_block_res_samples,
-            mid_block_res_sample=mid_block_res_sample,
-            up_block_res_samples=up_block_res_samples_new,
+            down_block_res_samples=brushnet_down_block_res_samples, 
+            mid_block_res_sample=brushnet_mid_block_res_sample,
+            up_block_res_samples=brushnet_up_block_res_samples
         )
+
+
+def zero_module(module):
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module

@@ -25,6 +25,7 @@ opencv-python>=4.8.0
 tqdm>=4.65.0
 tensorboard>=2.14.0
 omegaconf>=2.3.0
+wandb>=0.16.0  # Experiment tracking
 
 # HuggingFace Hub
 huggingface-hub>=0.19.0

@@ -515,7 +515,9 @@ class BrushNetModel(ModelMixin, ConfigMixin):
             conv_in_condition_weight[:,:4,...]=unet.conv_in.weight
             conv_in_condition_weight[:,4:8,...]=unet.conv_in.weight
             brushnet.conv_in_condition.weight=torch.nn.Parameter(conv_in_condition_weight)
-            brushnet.conv_in_condition.bias=unet.conv_in.bias
+            # IMPORTANT: Copy data instead of sharing reference to avoid dtype
+            # conflicts when UNet is later cast to fp16 while BrushNet stays fp32
+            brushnet.conv_in_condition.bias.data.copy_(unet.conv_in.bias.data)
 
             brushnet.time_proj.load_state_dict(unet.time_proj.state_dict())
             brushnet.time_embedding.load_state_dict(unet.time_embedding.state_dict())

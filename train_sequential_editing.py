@@ -889,10 +889,12 @@ def train_sequential_editing(args):
 
                 raw_down_samples = brushnet_output[0]
                 raw_mid_sample = brushnet_output[1]
+                raw_up_samples = brushnet_output[2]
                 
                 # Ensure residuals are correct dtype
                 down_block_res_samples = [res.to(dtype=weight_dtype) for res in raw_down_samples]
                 mid_block_res_sample = raw_mid_sample.to(dtype=weight_dtype)
+                up_block_res_samples = [res.to(dtype=weight_dtype) for res in raw_up_samples]
 
                 # Predict the noise residual
                 model_pred = unet(
@@ -902,6 +904,7 @@ def train_sequential_editing(args):
                     added_cond_kwargs=added_cond_kwargs,
                     down_block_add_samples=down_block_res_samples,
                     mid_block_add_sample=mid_block_res_sample,
+                    up_block_add_samples=up_block_res_samples,
                 ).sample
 
                 # Loss

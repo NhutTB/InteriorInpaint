@@ -45,8 +45,8 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffus
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 
 # Import custom models
-from ..models.unets.unet_2d_condition import UNet2DConditionModel
-from ..models.brushnet import BrushNetModel
+from models.unets.unet_2d_condition import UNet2DConditionModel
+from models.brushnet import BrushNetModel
 
 if is_invisible_watermark_available():
     from diffusers.pipelines.stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
@@ -319,15 +319,24 @@ class StableDiffusionXLHybridPipeline(
         return latents
 
     def prepare_brushnet_cond(self, image, mask, height, width, batch_size, num_images_per_prompt, device, dtype, generator=None):
-        # image is the masked source image (init_image * (1-mask))
-        # VAE encode image
+        # === Official TencentARC/BrushNet convention ===
+        # image: masked source image (inpaint region is black)
+        # mask: PIL image (white=inpaint region)
+        
+        # Preprocess image as normal (normalize [-1, 1])
         image = self.image_processor.preprocess(image, height=height, width=width).to(device=device, dtype=dtype)
         
-        # Resize mask to latent shape
-        # mask is usually single channel
-        mask = self.mask_processor.preprocess(mask, height=height, width=width).to(device=device, dtype=dtype)
+        # Preprocess mask as RGB image (same as official pipeline)
+        # Official uses self.prepare_image(mask) which normalizes to [-1,1]
+        # White (255) → +1.0, Black (0) → -1.0
+        # Then: original_mask = (original_mask.sum(1)[:,None,:,:] < 0)
+        # This gives: 1.0 for BLACK regions (KEEP), 0.0 for WHITE regions (INPAINT)
+        mask_rgb = mask.convert("RGB") if hasattr(mask, 'convert') else mask
+        mask_processed = self.image_processor.preprocess(mask_rgb, height=height, width=width).to(device=device, dtype=dtype)
+        # Official formula: sum rgb channels, if < 0 → True (1.0) = KEEP
+        original_mask = (mask_processed.sum(1, keepdim=True) < 0).to(dtype)
         
-        # Encode image
+        # Encode masked image with VAE
         if self.vae.config.force_upcast:
             image = image.float()
             self.vae.to(dtype=torch.float32)
@@ -347,21 +356,16 @@ class StableDiffusionXLHybridPipeline(
         init_latents = init_latents.to(dtype)
         init_latents = init_latents * self.vae.config.scaling_factor
 
-        # Resize mask to latent size
+        # Resize mask to latent spatial size
         mask = torch.nn.functional.interpolate(
-            mask, size=(init_latents.shape[-2], init_latents.shape[-1])
+            original_mask, size=(init_latents.shape[-2], init_latents.shape[-1])
         )
-        
-        # Concatenate latents and mask
-        # BrushNet expects 5 channels: 4 latent channels + 1 mask channel (or similar, check brushnet.py)
-        # BrushNet paper: VAE(masked_image) + resized_mask
         
         # Replicate for num_images_per_prompt
         if batch_size == 1:
             init_latents = init_latents.repeat(num_images_per_prompt, 1, 1, 1)
             mask = mask.repeat(num_images_per_prompt, 1, 1, 1)
         else:
-             # Assuming batch_size matches prompt batch size
             init_latents = init_latents.repeat_interleave(num_images_per_prompt, dim=0)
             mask = mask.repeat_interleave(num_images_per_prompt, dim=0)
             
@@ -434,7 +438,7 @@ class StableDiffusionXLHybridPipeline(
         
         # 1. Encode Input Prompt
         text_encoder_lora_scale = (
-            self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
         )
         (
             prompt_embeds,
@@ -555,79 +559,67 @@ class StableDiffusionXLHybridPipeline(
                 
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 
-                # ControlNet
-                if do_classifier_free_guidance:
-                    control_model_input = latents
-                    control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                    controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                    controlnet_added_cond_kwargs = {
-                        "text_embeds": add_text_embeds.chunk(2)[1],
-                        "time_ids": add_time_ids.chunk(2)[1],
-                    }
-                else:
-                    control_model_input = latent_model_input
-                    controlnet_prompt_embeds = prompt_embeds
-                    controlnet_added_cond_kwargs = added_cond_kwargs
+                # ControlNet (optional — skip if controlnet=None)
+                down_block_res_samples = None
+                mid_block_res_sample = None
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    control_model_input,
-                    t,
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    controlnet_cond=control_image,
-                    conditioning_scale=controlnet_conditioning_scale,
-                    guess_mode=False,
-                    added_cond_kwargs=controlnet_added_cond_kwargs,
-                    return_dict=False,
-                )
-                
-                if do_classifier_free_guidance: 
-                    # Apply ControlNet only to conditional
-                     down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
-                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
-                
-                # BrushNet
-                # BrushNet uses the SAME concept: inference on conditional branch, 0 on unconditional
-                # BrushNetModel forward:
-                # needs 'brushnet_cond' which is (latents + mask)
-                
-                # BrushNet takes: (sample, timestep, encoder_hidden_states, brushnet_cond, conditioning_scale)
-                
-                brushnet_out = self.brushnet(
-                    control_model_input, # Same input latents as ControlNet? Yes, usually the noisy latents.
-                    t,
-                    encoder_hidden_states=controlnet_prompt_embeds, # Same prompt embeds
-                    brushnet_cond=brushnet_cond, # VAE(image)+mask
-                    conditioning_scale=brushnet_conditioning_scale,
-                    return_dict=False
-                )
-                
-                bn_down_block_res_samples, bn_mid_block_res_sample, bn_up_block_res_samples = brushnet_out
-                
-                if do_classifier_free_guidance:
-                    bn_down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in bn_down_block_res_samples]
-                    bn_mid_block_res_sample = torch.cat([torch.zeros_like(bn_mid_block_res_sample), bn_mid_block_res_sample])
-                    bn_up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in bn_up_block_res_samples]
+                if self.controlnet is not None and control_image is not None:
+                    if do_classifier_free_guidance:
+                        control_model_input = self.scheduler.scale_model_input(latents, t)
+                        controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                        controlnet_added_cond_kwargs = {
+                            "text_embeds": add_text_embeds.chunk(2)[1],
+                            "time_ids": add_time_ids.chunk(2)[1],
+                        }
+                    else:
+                        control_model_input = latent_model_input
+                        controlnet_prompt_embeds = prompt_embeds
+                        controlnet_added_cond_kwargs = added_cond_kwargs
 
-                # UNet
-                # Pass BOTH residuals
-                noise_pred = self.unet(
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        control_model_input,
+                        t,
+                        encoder_hidden_states=controlnet_prompt_embeds,
+                        controlnet_cond=control_image,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        guess_mode=False,
+                        added_cond_kwargs=controlnet_added_cond_kwargs,
+                        return_dict=False,
+                    )
+                    if do_classifier_free_guidance:
+                        down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                        mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+
+                # BrushNet — follows official TencentARC convention exactly:
+                # BrushNet receives DOUBLED (CFG) + SCALED latents, DOUBLED prompt_embeds,
+                # DOUBLED brushnet_cond. Output already contains uncond+cond residuals.
+                brushnet_cond_input = torch.cat([brushnet_cond] * 2, dim=0) if do_classifier_free_guidance else brushnet_cond
+
+                bn_down_block_res_samples, bn_mid_block_res_sample, bn_up_block_res_samples = self.brushnet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
+                    added_cond_kwargs=added_cond_kwargs,
+                    brushnet_cond=brushnet_cond_input,
+                    conditioning_scale=brushnet_conditioning_scale,
+                    return_dict=False
+                )
+
+                # UNet — kết hợp BrushNet residuals (+ ControlNet nếu có)
+                unet_kwargs = dict(
+                    encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     added_cond_kwargs=added_cond_kwargs,
-                    
-                    # ControlNet Residuals
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
-                    
-                    # BrushNet Residuals
                     down_block_add_samples=bn_down_block_res_samples,
                     mid_block_add_sample=bn_mid_block_res_sample,
                     up_block_add_samples=bn_up_block_res_samples,
-                    
                     return_dict=False,
-                )[0]
+                )
+                if down_block_res_samples is not None:
+                    unet_kwargs["down_block_additional_residuals"] = down_block_res_samples
+                    unet_kwargs["mid_block_additional_residual"]   = mid_block_res_sample
+
+                noise_pred = self.unet(latent_model_input, t, **unet_kwargs)[0]
 
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
